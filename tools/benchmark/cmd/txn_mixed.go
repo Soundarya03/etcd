@@ -45,6 +45,7 @@ var (
 	mixedTxnReadWriteRatio float64
 	mixedTxnRangeLimit     int64
 	mixedTxnEndKey         string
+    mixedTxnPrefix         string
 
 	writeOpsTotal uint64
 	readOpsTotal  uint64
@@ -62,6 +63,7 @@ func init() {
 	mixedTxnCmd.Flags().IntVar(&keySpaceSize, "key-space-size", 1, "Maximum possible keys")
 	mixedTxnCmd.Flags().StringVar(&rangeConsistency, "consistency", "l", "Linearizable(l) or Serializable(s)")
 	mixedTxnCmd.Flags().Float64Var(&mixedTxnReadWriteRatio, "rw-ratio", 1, "Read/write ops ratio")
+	mixedTxnCmd.Flags().StringVar(&mixedTxnPrefix, "prefix", "", "Key prefix for all operations")
 }
 
 type request struct {
@@ -119,17 +121,28 @@ func mixedTxnFunc(cmd *cobra.Command, _ []string) {
 		for i := 0; i < mixedTxnTotal; i++ {
 			var req request
 			if rand.Float64() < mixedTxnReadWriteRatio/(1+mixedTxnReadWriteRatio) {
-				opts := []v3.OpOption{v3.WithRange(mixedTxnEndKey)}
+			    baseKey := mixedTxnPrefix
+                opts := []v3.OpOption{}
+
+                // Determine the range end key
+                if mixedTxnEndKey != "" {
+                    // If end-key is specified, use it with the prefix
+                    opts = append(opts, v3.WithRange(mixedTxnPrefix + mixedTxnEndKey))
+                } else {
+                    // Otherwise, use prefix range to query all keys under the prefix
+                    opts = append(opts, v3.WithPrefix())
+                }
 				if rangeConsistency == "s" {
 					opts = append(opts, v3.WithSerializable())
 				}
-				opts = append(opts, v3.WithPrefix(), v3.WithLimit(mixedTxnRangeLimit))
-				req.op = v3.OpGet("", opts...)
+				opts = append(opts, v3.WithLimit(mixedTxnRangeLimit))
+				req.op = v3.OpGet(baseKey, opts...)
 				req.isWrite = false
 				readOpsTotal++
 			} else {
 				binary.PutVarint(k, int64(i%keySpaceSize))
-				req.op = v3.OpPut(string(k), v)
+				fullKey := mixedTxnPrefix + string(k)
+				req.op = v3.OpPut(fullKey, v)
 				req.isWrite = true
 				writeOpsTotal++
 			}
