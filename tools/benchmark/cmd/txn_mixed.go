@@ -17,10 +17,14 @@ package cmd
 import (
 	"context"
 	"encoding/binary"
+	"encoding/json"
 	"fmt"
 	"math"
 	"math/rand"
 	"os"
+	"sort"
+	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/cheggaaa/pb/v3"
@@ -45,6 +49,7 @@ var (
 	mixedTxnReadWriteRatio float64
 	mixedTxnRangeLimit     int64
 	mixedTxnEndKey         string
+	mixedTxnReportInterval int
 
 	writeOpsTotal uint64
 	readOpsTotal  uint64
@@ -62,6 +67,7 @@ func init() {
 	mixedTxnCmd.Flags().IntVar(&keySpaceSize, "key-space-size", 1, "Maximum possible keys")
 	mixedTxnCmd.Flags().StringVar(&rangeConsistency, "consistency", "l", "Linearizable(l) or Serializable(s)")
 	mixedTxnCmd.Flags().Float64Var(&mixedTxnReadWriteRatio, "rw-ratio", 1, "Read/write ops ratio")
+	mixedTxnCmd.Flags().IntVar(&mixedTxnReportInterval, "report-interval", 10, "Print live JSON metrics every N seconds (min=1, -1 to disable)")
 }
 
 type request struct {
@@ -69,10 +75,108 @@ type request struct {
 	op      v3.Op
 }
 
+type liveStats struct { 
+	mutex sync.Mutex 
+	
+	// full history
+	readLats []float64 
+	writeLats []float64 
+	
+	// interval window (reset every tick) 
+	intervalReadLats []float64 
+	intervalWriteLats []float64 
+	intervalStart time.Time 
+}
+
+func newLiveStats() *liveStats { 
+	now := time.Now() 
+	return &liveStats{
+		intervalStart: now, 
+	} 
+}
+
+func (ls *liveStats) add(isWrite bool, dur time.Duration) {
+    sec := dur.Seconds()
+
+    ls.mutex.Lock()
+    defer ls.mutex.Unlock()
+
+    if isWrite {
+        ls.writeLats = append(ls.writeLats, sec) 
+		ls.intervalWriteLats = append(ls.intervalWriteLats, sec)
+    } else {
+        ls.readLats = append(ls.readLats, sec)
+		ls.intervalReadLats = append(ls.intervalReadLats, sec)
+    }
+}
+
+type liveSnapshot struct {
+    ID         uint64    `json:"id"`
+    Timestamp  string    `json:"ts"`
+    ElapsedSec float64   `json:"elapsed_sec"`
+
+    Read struct {
+        Ops int     `json:"ops"`
+        RPS float64 `json:"rps"`
+        Avg float64 `json:"avg"`
+        P50 float64 `json:"p50"`
+        P90 float64 `json:"p90"`
+        P99 float64 `json:"p99"`
+    } `json:"read"`
+
+    Write struct {
+        Ops int     `json:"ops"`
+        RPS float64 `json:"rps"`
+        Avg float64 `json:"avg"`
+        P50 float64 `json:"p50"`
+        P90 float64 `json:"p90"`
+        P99 float64 `json:"p99"`
+    } `json:"write"`
+}
+
+func summarize(lats []float64, elapsed float64) (ops int, rps, avg, p50, p90, p99 float64) {
+    ops = len(lats)
+    if ops == 0 || elapsed == 0 {
+        return
+    }
+
+    cp := append([]float64(nil), lats...)
+    sort.Float64s(cp)
+
+    var sum float64
+    for _, v := range cp {
+        sum += v
+    }
+
+    avg = sum / float64(ops)
+    rps = float64(ops) / elapsed
+
+    idx := func(p float64) int {
+        return int(p/100.0 * float64(len(cp)-1))
+    }
+
+    p50 = cp[idx(50)]
+    p90 = cp[idx(90)]
+    p99 = cp[idx(99)]
+    return
+}
+
 func mixedTxnFunc(cmd *cobra.Command, _ []string) {
 	if keySpaceSize <= 0 {
 		fmt.Fprintf(os.Stderr, "expected positive --key-space-size, got (%v)", keySpaceSize)
 		os.Exit(1)
+	}
+
+	switch { 
+		case mixedTxnReportInterval == -1: 
+		case mixedTxnReportInterval == 0: 
+			fmt.Fprintf(os.Stderr, "--report-interval=0 invalid; use -1 to disable\n")
+			os.Exit(1)
+		case mixedTxnReportInterval < -1:
+			fmt.Fprintf(os.Stderr, "--report-interval must be >=1. Or -1 to disable.\n")
+			os.Exit(1)
+		case mixedTxnReportInterval < 1:
+			mixedTxnReportInterval = 1
 	}
 
 	if rangeConsistency == "l" {
@@ -97,6 +201,74 @@ func mixedTxnFunc(cmd *cobra.Command, _ []string) {
 
 	reportRead := newReport(cmd.Name() + "-read")
 	reportWrite := newReport(cmd.Name() + "-write")
+
+	live := newLiveStats()
+
+	var snapshotID uint64
+	var stopLive chan struct{}
+
+	if mixedTxnReportInterval > 0 {
+		stopLive = make(chan struct{})
+		ticker := time.NewTicker(time.Duration(mixedTxnReportInterval) * time.Second)
+
+		go func() {
+			defer ticker.Stop()
+			for {
+				select {
+				case <-ticker.C:
+						live.mutex.Lock()
+
+						readCopy := append([]float64(nil), live.intervalReadLats...) 
+						writeCopy := append([]float64(nil), live.intervalWriteLats...) 
+						intervalElapsed := time.Since(live.intervalStart).Seconds()
+						live.intervalReadLats = nil
+						live.intervalWriteLats = nil
+						live.intervalStart = time.Now()
+
+						live.mutex.Unlock()
+
+						if len(readCopy)+len(writeCopy) == 0 {
+							continue
+						}
+
+						rc, rrps, ravg, rp50, rp90, rp99 := 
+							summarize(readCopy, intervalElapsed) 
+						wc, wrps, wavg, wp50, wp90, wp99 := 
+							summarize(writeCopy, intervalElapsed) 
+							
+						snap := liveSnapshot{ 
+							ID: atomic.AddUint64(&snapshotID, 1), 
+							Timestamp: time.Now().UTC().Format(time.RFC3339), 
+							ElapsedSec: intervalElapsed, 
+						}
+
+						snap.Read.Ops = rc
+						snap.Read.RPS = rrps
+						snap.Read.Avg = ravg
+						snap.Read.P50 = rp50
+						snap.Read.P90 = rp90
+						snap.Read.P99 = rp99
+
+						snap.Write.Ops = wc
+						snap.Write.RPS = wrps
+						snap.Write.Avg = wavg
+						snap.Write.P50 = wp50
+						snap.Write.P90 = wp90
+						snap.Write.P99 = wp99
+
+						b, err := json.Marshal(snap) 
+						if err != nil { 
+							fmt.Fprintf(os.Stderr, "marshal error: %v\n", err) 
+							continue 
+						} 
+						fmt.Println(string(b))
+				case <-stopLive:
+					return
+				}
+			}
+		}()
+	}
+
 	for i := range clients {
 		wg.Add(1)
 		go func(c *v3.Client) {
@@ -105,11 +277,21 @@ func mixedTxnFunc(cmd *cobra.Command, _ []string) {
 				limit.Wait(context.Background())
 				st := time.Now()
 				_, err := c.Txn(context.TODO()).Then(req.op).Commit()
-				if req.isWrite {
-					reportWrite.Results() <- report.Result{Err: err, Start: st, End: time.Now()}
-				} else {
-					reportRead.Results() <- report.Result{Err: err, Start: st, End: time.Now()}
+				end := time.Now()
+
+				res := report.Result{
+					Err:   err,
+					Start: st,
+					End:   end,
 				}
+
+				if req.isWrite {
+					reportWrite.Results() <- res
+				} else {
+					reportRead.Results() <- res
+				}
+
+				live.add(req.isWrite, end.Sub(st))
 				bar.Increment()
 			}
 		}(clients[i])
@@ -126,12 +308,12 @@ func mixedTxnFunc(cmd *cobra.Command, _ []string) {
 				opts = append(opts, v3.WithPrefix(), v3.WithLimit(mixedTxnRangeLimit))
 				req.op = v3.OpGet("", opts...)
 				req.isWrite = false
-				readOpsTotal++
+				atomic.AddUint64(&readOpsTotal, 1)
 			} else {
 				binary.PutVarint(k, int64(i%keySpaceSize))
 				req.op = v3.OpPut(string(k), v)
 				req.isWrite = true
-				writeOpsTotal++
+				atomic.AddUint64(&writeOpsTotal, 1)
 			}
 			requests <- req
 		}
@@ -144,8 +326,11 @@ func mixedTxnFunc(cmd *cobra.Command, _ []string) {
 	close(reportRead.Results())
 	close(reportWrite.Results())
 	bar.Finish()
-	fmt.Printf("Total Read Ops: %d\nDetails:", readOpsTotal)
-	fmt.Println(<-rcRead)
-	fmt.Printf("Total Write Ops: %d\nDetails:", writeOpsTotal)
+	if stopLive != nil {
+    	close(stopLive)
+	}
+	fmt.Printf("Total Read Ops: %d\nDetails:", atomic.LoadUint64(&readOpsTotal)) 
+	fmt.Println(<-rcRead) 
+	fmt.Printf("Total Write Ops: %d\nDetails:", atomic.LoadUint64(&writeOpsTotal)) 
 	fmt.Println(<-rcWrite)
 }
