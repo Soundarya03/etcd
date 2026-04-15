@@ -272,7 +272,8 @@ func mixedTxnFunc(cmd *cobra.Command, _ []string) {
 						fmt.Fprintf(os.Stderr, "marshal error: %v\n", err)
 						continue
 					}
-					fmt.Println(string(b))
+					// Progress bar renders on the current line; prepend a newline so JSON is line-delimited.
+					fmt.Printf("\n%s\n", b)
 				case <-stopLive:
 					return
 				}
