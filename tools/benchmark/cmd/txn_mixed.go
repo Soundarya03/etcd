@@ -210,8 +210,6 @@ func mixedTxnFunc(cmd *cobra.Command, _ []string) {
 	bar = pb.New(mixedTxnTotal)
 	bar.Start()
 
-	startTime := time.Now()
-
 	sigCh := make(chan os.Signal, 1)
 	signal.Notify(sigCh, syscall.SIGTERM)
 	defer signal.Stop(sigCh)
@@ -372,32 +370,8 @@ func mixedTxnFunc(cmd *cobra.Command, _ []string) {
 		close(stopLive)
 	}
 
-	if ctx.Err() != nil {
-		// SIGTERM received: print final summary from full latency history.
-		printFinalSummary(live, startTime)
-		return
-	}
-
 	fmt.Printf("Total Read Ops: %d\nDetails:", atomic.LoadUint64(&readOpsTotal))
 	fmt.Println(<-rcRead)
 	fmt.Printf("Total Write Ops: %d\nDetails:", atomic.LoadUint64(&writeOpsTotal))
 	fmt.Println(<-rcWrite)
-}
-
-func printFinalSummary(live *liveStats, startTime time.Time) {
-	live.mutex.Lock()
-	readLats := append([]float64(nil), live.readLats...)
-	writeLats := append([]float64(nil), live.writeLats...)
-	live.mutex.Unlock()
-
-	elapsed := time.Since(startTime).Seconds()
-
-	rc, rrps, ravg, rstddev, rp50, rp90, rp99 := summarize(readLats, elapsed)
-	wc, wrps, wavg, wstddev, wp50, wp90, wp99 := summarize(writeLats, elapsed)
-
-	fmt.Println("\n--- Final Summary (interrupted by SIGTERM) ---")
-	fmt.Printf("Read  ops=%d rps=%.2f avg=%.4fs stddev=%.4fs p50=%.4fs p90=%.4fs p99=%.4fs\n",
-		rc, rrps, ravg, rstddev, rp50, rp90, rp99)
-	fmt.Printf("Write ops=%d rps=%.2f avg=%.4fs stddev=%.4fs p50=%.4fs p90=%.4fs p99=%.4fs\n",
-		wc, wrps, wavg, wstddev, wp50, wp90, wp99)
 }
