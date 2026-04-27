@@ -178,17 +178,10 @@ func mixedTxnFunc(cmd *cobra.Command, _ []string) {
 		os.Exit(1)
 	}
 
-	switch {
-	case mixedTxnReportInterval == -1:
-	case mixedTxnReportInterval == 0:
-		fmt.Fprintf(os.Stderr, "--report-interval=0 invalid; use -1 to disable\n")
-		os.Exit(1)
-	case mixedTxnReportInterval < -1:
+	if mixedTxnReportInterval < -1 || mixedTxnReportInterval == 0 {
 		fmt.Fprintf(os.Stderr, "--report-interval must be >=1. Or -1 to disable.\n")
 		os.Exit(1)
-	case mixedTxnReportInterval < 1:
-		mixedTxnReportInterval = 1
-	}
+	}	
 
 	if rangeConsistency == "l" {
 		fmt.Println("bench with linearizable range")
@@ -208,6 +201,9 @@ func mixedTxnFunc(cmd *cobra.Command, _ []string) {
 	k, v := make([]byte, keySize), string(mustRandBytes(valSize))
 
 	bar = pb.New(mixedTxnTotal)
+	if mixedTxnReportInterval > 0 {
+		bar.SetWriter(os.Stderr)
+	}
 	bar.Start()
 
 	sigCh := make(chan os.Signal, 1)
@@ -289,8 +285,8 @@ func mixedTxnFunc(cmd *cobra.Command, _ []string) {
 						fmt.Fprintf(os.Stderr, "marshal error: %v\n", err)
 						continue
 					}
-					// Progress bar renders on the current line; prepend a newline so JSON is line-delimited.
-					fmt.Printf("\n%s\n", b)
+					// write intermediate JSON snapshot to stdout, when report interval is enabled
+					fmt.Fprintln(os.Stdout, string(b))
 				case <-stopLive:
 					return
 				}
@@ -370,8 +366,13 @@ func mixedTxnFunc(cmd *cobra.Command, _ []string) {
 		close(stopLive)
 	}
 
-	fmt.Printf("Total Read Ops: %d\nDetails:", atomic.LoadUint64(&readOpsTotal))
-	fmt.Println(<-rcRead)
-	fmt.Printf("Total Write Ops: %d\nDetails:", atomic.LoadUint64(&writeOpsTotal))
-	fmt.Println(<-rcWrite)
+	// direct final summary to stderr if report interval is enabled, to separate it from live JSON snapshots in stdout
+	summaryOut := os.Stdout
+	if mixedTxnReportInterval > 0 {
+		summaryOut = os.Stderr
+	}
+	fmt.Fprintf(summaryOut, "Total Read Ops: %d\nDetails:", atomic.LoadUint64(&readOpsTotal))
+	fmt.Fprintln(summaryOut, <-rcRead)
+	fmt.Fprintf(summaryOut, "Total Write Ops: %d\nDetails:", atomic.LoadUint64(&writeOpsTotal))
+	fmt.Fprintln(summaryOut, <-rcWrite)
 }
