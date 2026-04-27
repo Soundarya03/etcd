@@ -181,12 +181,17 @@ func mixedTxnFunc(cmd *cobra.Command, _ []string) {
 	if mixedTxnReportInterval < -1 || mixedTxnReportInterval == 0 {
 		fmt.Fprintf(os.Stderr, "--report-interval must be >=1. Or -1 to disable.\n")
 		os.Exit(1)
-	}	
+	}
+
+	messageOut := os.Stdout
+	if mixedTxnReportInterval > 0 {
+		messageOut = os.Stderr
+	}
 
 	if rangeConsistency == "l" {
-		fmt.Println("bench with linearizable range")
+		fmt.Fprintln(messageOut, "bench with linearizable range")
 	} else if rangeConsistency == "s" {
-		fmt.Println("bench with serializable range")
+		fmt.Fprintln(messageOut, "bench with serializable range")
 	} else {
 		fmt.Fprintln(os.Stderr, cmd.Usage())
 		os.Exit(1)
